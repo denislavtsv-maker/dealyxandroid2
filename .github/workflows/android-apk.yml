@@ -1,0 +1,121 @@
+name: DEALYX Android APK - TypeScript Dependency Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Locate Capacitor project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repository root: $GITHUB_WORKSPACE"
+          CONFIG_PATH="$(find . -type d \( -name .git -o -name node_modules -o -name .gradle \) -prune -o -type f \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' \) -print | sort | head -n 1)"
+          if [ -z "$CONFIG_PATH" ]; then
+            echo "::error title=Capacitor config missing::No capacitor.config.ts/json/js was found. Upload the Android source files to the repository root."
+            find . -maxdepth 4 -type f \( -name package.json -o -name capacitor.config.json -o -name capacitor.config.ts \) -print || true
+            exit 1
+          fi
+          APP_DIR="$(dirname "$CONFIG_PATH")"
+          if [ ! -f "$APP_DIR/package.json" ]; then
+            echo "::error title=package.json missing::Found $CONFIG_PATH but no package.json beside it."
+            exit 1
+          fi
+          echo "Using config: $CONFIG_PATH"
+          echo "Using package: $APP_DIR/package.json"
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies including TypeScript
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Project directory: $(pwd)"
+          node --version
+          npm --version
+          node -e "const p=require('./package.json'); console.log('Project:',p.name); console.log('Capacitor CLI:',p.devDependencies?.['@capacitor/cli'] || p.dependencies?.['@capacitor/cli'] || 'MISSING')"
+          npm install --include=dev --no-audit --no-fund
+          # Capacitor detects capacitor.config.ts automatically. Install the real TypeScript
+          # compiler explicitly before invoking any Capacitor command; do not use npx tsc
+          # until this local dependency has been installed.
+          npm install --save-dev 'typescript@^5.8.3' --include=dev --no-audit --no-fund
+          test -x node_modules/.bin/tsc || { echo '::error title=TypeScript missing::Local TypeScript compiler was not installed.'; npm ls typescript || true; exit 1; }
+          test -x node_modules/.bin/cap || { echo '::error title=Capacitor CLI missing::Local Capacitor CLI was not installed.'; npm ls @capacitor/cli || true; exit 1; }
+          echo "TypeScript version:"
+          ./node_modules/.bin/tsc --version
+          echo "Capacitor version:"
+          ./node_modules/.bin/cap --version
+          npm ls typescript @capacitor/cli @capacitor/core @capacitor/android --depth=0
+
+      - name: Ensure Capacitor webDir fallback exists
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p www
+          if [ ! -f www/index.html ]; then
+            cat > www/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DEALYX</title></head>
+          <body style="margin:0;font-family:system-ui;background:#f8f9f2;color:#18251d;display:grid;place-items:center;min-height:100vh"><main style="text-align:center;padding:24px"><h1>DEALYX</h1><p>Connecting to dealyx.online…</p><p>Please check your internet connection.</p></main></body></html>
+          HTML
+          fi
+
+      - name: Generate Android project if missing
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            ./node_modules/.bin/cap add android
+          else
+            echo "android/ already exists; keeping the native project."
+          fi
+
+      - name: Generate app icons and splash screens
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: npm run assets:generate
+
+      - name: Sync Capacitor
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: ./node_modules/.bin/cap sync android
+
+      - name: Build debug APK
+        working-directory: ${{ steps.project.outputs.app_dir }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dealyx-debug-apk
+          path: ${{ steps.project.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
