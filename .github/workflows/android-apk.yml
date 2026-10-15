@@ -1,4 +1,4 @@
-name: DEALYX Android APK - TypeScript Dependency Fix
+name: DEALYX Android APK - Back Navigation Fix
 
 on:
   workflow_dispatch:
@@ -31,11 +31,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Repository root: $GITHUB_WORKSPACE"
           CONFIG_PATH="$(find . -type d \( -name .git -o -name node_modules -o -name .gradle \) -prune -o -type f \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' \) -print | sort | head -n 1)"
           if [ -z "$CONFIG_PATH" ]; then
-            echo "::error title=Capacitor config missing::No capacitor.config.ts/json/js was found. Upload the Android source files to the repository root."
-            find . -maxdepth 4 -type f \( -name package.json -o -name capacitor.config.json -o -name capacitor.config.ts \) -print || true
+            echo "::error title=Capacitor config missing::No Capacitor config was found."
             exit 1
           fi
           APP_DIR="$(dirname "$CONFIG_PATH")"
@@ -43,8 +41,6 @@ jobs:
             echo "::error title=package.json missing::Found $CONFIG_PATH but no package.json beside it."
             exit 1
           fi
-          echo "Using config: $CONFIG_PATH"
-          echo "Using package: $APP_DIR/package.json"
           echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies including TypeScript
@@ -52,20 +48,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Project directory: $(pwd)"
-          node --version
-          npm --version
-          node -e "const p=require('./package.json'); console.log('Project:',p.name); console.log('Capacitor CLI:',p.devDependencies?.['@capacitor/cli'] || p.dependencies?.['@capacitor/cli'] || 'MISSING')"
           npm install --include=dev --no-audit --no-fund
-          # Capacitor detects capacitor.config.ts automatically. Install the real TypeScript
-          # compiler explicitly before invoking any Capacitor command; do not use npx tsc
-          # until this local dependency has been installed.
           npm install --save-dev 'typescript@^5.8.3' --include=dev --no-audit --no-fund
-          test -x node_modules/.bin/tsc || { echo '::error title=TypeScript missing::Local TypeScript compiler was not installed.'; npm ls typescript || true; exit 1; }
-          test -x node_modules/.bin/cap || { echo '::error title=Capacitor CLI missing::Local Capacitor CLI was not installed.'; npm ls @capacitor/cli || true; exit 1; }
-          echo "TypeScript version:"
+          test -x node_modules/.bin/tsc
+          test -x node_modules/.bin/cap
           ./node_modules/.bin/tsc --version
-          echo "Capacitor version:"
           ./node_modules/.bin/cap --version
           npm ls typescript @capacitor/cli @capacitor/core @capacitor/android --depth=0
 
@@ -93,6 +80,42 @@ jobs:
           else
             echo "android/ already exists; keeping the native project."
           fi
+
+      - name: Configure Android Back button to navigate WebView history
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID="$(node -e "const fs=require('fs'); const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8')); process.stdout.write(c.appId)")"
+          MAIN_ACTIVITY_PATH="$(find android/app/src/main -type f -name 'MainActivity.java' -print -quit || true)"
+          if [ -z "$MAIN_ACTIVITY_PATH" ]; then
+            PACKAGE_PATH="${APP_ID//./\/}"
+            MAIN_ACTIVITY_PATH="android/app/src/main/java/${PACKAGE_PATH}/MainActivity.java"
+            mkdir -p "$(dirname "$MAIN_ACTIVITY_PATH")"
+          fi
+          cat > "$MAIN_ACTIVITY_PATH" <<JAVA
+          package ${APP_ID};
+
+          import android.webkit.WebView;
+          import com.getcapacitor.Bridge;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onBackPressed() {
+                  Bridge bridge = getBridge();
+                  WebView webView = bridge == null ? null : bridge.getWebView();
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                      return;
+                  }
+                  super.onBackPressed();
+              }
+          }
+          JAVA
+          grep -q 'webView.goBack()' "$MAIN_ACTIVITY_PATH"
+          echo "Back navigation configured in $MAIN_ACTIVITY_PATH"
 
       - name: Generate app icons and splash screens
         working-directory: ${{ steps.project.outputs.app_dir }}
