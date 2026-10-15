@@ -1,0 +1,152 @@
+name: DEALYX Android APK - SPA Back Navigation Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Locate Capacitor project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_PATH="$(find . -type d \( -name .git -o -name node_modules -o -name .gradle \) -prune -o -type f \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' \) -print | sort | head -n 1)"
+          if [ -z "$CONFIG_PATH" ]; then
+            echo "::error title=Capacitor config missing::No Capacitor config was found."
+            exit 1
+          fi
+          APP_DIR="$(dirname "$CONFIG_PATH")"
+          if [ ! -f "$APP_DIR/package.json" ]; then
+            echo "::error title=package.json missing::Found $CONFIG_PATH but no package.json beside it."
+            exit 1
+          fi
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies including TypeScript
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --include=dev --no-audit --no-fund
+          npm install --save-dev 'typescript@^5.8.3' --include=dev --no-audit --no-fund
+          test -x node_modules/.bin/tsc
+          test -x node_modules/.bin/cap
+          ./node_modules/.bin/tsc --version
+          ./node_modules/.bin/cap --version
+          npm ls typescript @capacitor/cli @capacitor/core @capacitor/android --depth=0
+
+      - name: Ensure Capacitor webDir fallback exists
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p www
+          if [ ! -f www/index.html ]; then
+            cat > www/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DEALYX</title></head>
+          <body style="margin:0;font-family:system-ui;background:#f8f9f2;color:#18251d;display:grid;place-items:center;min-height:100vh"><main style="text-align:center;padding:24px"><h1>DEALYX</h1><p>Connecting to dealyx.online…</p><p>Please check your internet connection.</p></main></body></html>
+          HTML
+          fi
+
+      - name: Generate Android project if missing
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            ./node_modules/.bin/cap add android
+          else
+            echo "android/ already exists; keeping the native project."
+          fi
+
+      - name: Configure Android system Back to navigate Dealyx route history
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_ID="$(node -e "const fs=require('fs'); const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8')); process.stdout.write(c.appId)")"
+          MAIN_ACTIVITY_PATH="$(find android/app/src/main -type f -name 'MainActivity.java' -print -quit || true)"
+          if [ -z "$MAIN_ACTIVITY_PATH" ]; then
+            PACKAGE_PATH="${APP_ID//./\/}"
+            MAIN_ACTIVITY_PATH="android/app/src/main/java/${PACKAGE_PATH}/MainActivity.java"
+            mkdir -p "$(dirname "$MAIN_ACTIVITY_PATH")"
+          fi
+          cat > "$MAIN_ACTIVITY_PATH" <<JAVA
+          package ${APP_ID};
+
+          import android.webkit.WebView;
+          import com.getcapacitor.Bridge;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onBackPressed() {
+                  Bridge bridge = getBridge();
+                  WebView webView = bridge == null ? null : bridge.getWebView();
+                  if (webView != null) {
+                      // Delegate to the website's SPA-aware history stack. The JS bridge
+                      // closes overlays first, navigates to the previous route, and stays
+                      // at the app root instead of minimizing the Activity.
+                      webView.evaluateJavascript(
+                          "(function(){try{if(typeof window.DEALYX_APP_GO_BACK==='function'){window.DEALYX_APP_GO_BACK();return;}if(window.history&&window.history.length>1){window.history.back();}}catch(e){}})();",
+                          null
+                      );
+                      return;
+                  }
+                  // If the WebView has not finished starting, keep the Activity alive;
+                  // a later Back press will be handled by the SPA-aware JavaScript bridge.
+                  return;
+              }
+          }
+          JAVA
+          grep -q 'window.DEALYX_APP_GO_BACK' "$MAIN_ACTIVITY_PATH"
+          echo "SPA-aware Android Back configured in $MAIN_ACTIVITY_PATH"
+
+      - name: Generate app icons and splash screens
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: npm run assets:generate
+
+      - name: Sync Capacitor
+        working-directory: ${{ steps.project.outputs.app_dir }}
+        shell: bash
+        run: ./node_modules/.bin/cap sync android
+
+      - name: Build debug APK
+        working-directory: ${{ steps.project.outputs.app_dir }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dealyx-debug-apk
+          path: ${{ steps.project.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
